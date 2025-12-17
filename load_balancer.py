@@ -130,7 +130,9 @@ def algo_weighted_rr(cluster_workers, counter):
 
 def algo_least_response(cluster_workers):
     with stats_lock:
-        return min(cluster_workers, key=lambda w: worker_response_times.get(w, 1.0))
+        # Hibrit: Response Time * (1 + Active Connections)
+        # Hizli ama dolu sunuculari cezalandirir.
+        return min(cluster_workers, key=lambda w: worker_response_times.get(w, 1.0) * (1 + active_connections.get(w, 0)))
 
 def algo_least_connections(cluster_workers):
     with stats_lock:
