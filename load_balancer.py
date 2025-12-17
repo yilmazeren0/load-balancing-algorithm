@@ -4,26 +4,49 @@ import threading
 import sqlite3
 import random
 import traceback
-from queue import Queue
-from confluent_kafka import Consumer, Producer, KafkaError, KafkaException
-import collections
+import requests
+from queue import Queue, Empty
+from concurrent.futures import ThreadPoolExecutor
+from confluent_kafka import Consumer, KafkaError
 
 # Configuration
 KAFKA_BROKER = 'localhost:9093'
 INPUT_TOPIC = 'iot-sensor-data'
 DB_FILE = 'metrics.db'
 
+# Clusters
+CLUSTER_A = 'Cluster-A' # Round Robin
+CLUSTER_B = 'Cluster-B' # Weighted Round Robin
+CLUSTER_C = 'Cluster-C' # Least Connections
+CLUSTER_D = 'Cluster-D' # Least Response Time
+
 # Algorithms
 ALGO_ROUND_ROBIN = 'Round Robin'
+ALGO_WEIGHTED_RR = 'Weighted Round Robin'
+ALGO_LEAST_CONN = 'Least Connections'
 ALGO_LEAST_RESPONSE = 'Least Response Time'
 
-# Global State
-num_workers = 3
-workers = [f"Worker-{i+1}" for i in range(num_workers)]
-worker_queues = {w: Queue() for w in workers}
-worker_stats = {w: {'cpu': 0.0, 'processing_time': 0.0, 'tasks_processed': 0} for w in workers}
-current_algo = ALGO_ROUND_ROBIN 
+# Worker Config
+workers_config = {
+    CLUSTER_A: ['http://localhost:5001', 'http://localhost:5002', 'http://localhost:5003'],
+    CLUSTER_B: ['http://localhost:5004', 'http://localhost:5005', 'http://localhost:5006'],
+    CLUSTER_C: ['http://localhost:5007', 'http://localhost:5008', 'http://localhost:5009'],
+    CLUSTER_D: ['http://localhost:5010', 'http://localhost:5011', 'http://localhost:5012']
+}
+
+# Static Weights for Cluster B
+weights = {
+    'http://localhost:5004': 1, 
+    'http://localhost:5005': 2, 
+    'http://localhost:5006': 3
+}
+
+# State Tracking
+worker_response_times = {w: 0.05 for cluster in workers_config.values() for w in cluster}
+active_connections = {w: 0 for cluster in workers_config.values() for w in cluster}
+
 db_lock = threading.Lock()
+stats_lock = threading.Lock()
 
 def init_db():
     with sqlite3.connect(DB_FILE) as conn:
@@ -33,137 +56,149 @@ def init_db():
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 timestamp REAL,
                 worker_id TEXT,
+                cluster_id TEXT,
                 processing_time REAL,
-                queue_depth INTEGER,
-                cpu_utilization REAL,
                 algorithm TEXT
             )
         ''')
         conn.commit()
 
-def log_metric(worker_id, processing_time, queue_depth, cpu_utilization):
+def log_metric(worker_id, cluster_id, processing_time, algo):
     try:
         with db_lock:
             with sqlite3.connect(DB_FILE) as conn:
                 cursor = conn.cursor()
                 cursor.execute('''
-                    INSERT INTO metrics (timestamp, worker_id, processing_time, queue_depth, cpu_utilization, algorithm)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                ''', (time.time(), worker_id, processing_time, queue_depth, cpu_utilization, current_algo))
+                    INSERT INTO metrics (timestamp, worker_id, cluster_id, processing_time, algorithm)
+                    VALUES (?, ?, ?, ?, ?)
+                ''', (time.time(), worker_id, cluster_id, processing_time, algo))
                 conn.commit()
     except Exception as e:
-        print(f"Error logging metric: {e}")
+        print(f"Error logging: {e}")
 
-def worker_thread(worker_id):
-    """Simulates a worker processing tasks."""
-    while True:
-        try:
-            task = worker_queues[worker_id].get(timeout=1)
-            
-            # Simulate CPU load and processing time
-            start_time = time.time()
-            
-            # Processing time affected by "CPU load"
-            base_processing_time = random.uniform(0.01, 0.05) 
-            if random.random() < 0.1:
-                base_processing_time *= 5
-            
-            time.sleep(base_processing_time)
-            
-            end_time = time.time()
-            duration = end_time - start_time
-            
-            # Update internal stats
-            worker_stats[worker_id]['processing_time'] = duration
-            worker_stats[worker_id]['cpu'] = min(100.0, (duration * 1000) + random.uniform(-10, 10))
-            worker_stats[worker_id]['tasks_processed'] += 1
+def update_stats(worker_url, delta_conn=0, duration=None):
+    with stats_lock:
+        if delta_conn != 0:
+            active_connections[worker_url] += delta_conn
+        if duration is not None:
+             # Exponential Moving Average for response time
+             old_val = worker_response_times.get(worker_url, 0.05)
+             worker_response_times[worker_url] = 0.7 * old_val + 0.3 * duration
 
+def handle_request(worker_url, data, cluster_id, algorithm):
+    try:
+        # Increment active connections
+        update_stats(worker_url, delta_conn=1)
+        
+        resp = requests.post(f"{worker_url}/process", json=data, timeout=5)
+        
+        # Decrement active connections
+        update_stats(worker_url, delta_conn=-1)
+        
+        if resp.status_code == 200:
+            res_json = resp.json()
+            duration = res_json['duration_s']
+            
+            # Update response time stat
+            update_stats(worker_url, duration=duration)
+            
             # Log to DB
-            q_depth = worker_queues[worker_id].qsize()
-            log_metric(worker_id, duration, q_depth, worker_stats[worker_id]['cpu'])
+            log_metric(res_json['worker_id'], cluster_id, duration, algorithm)
             
-            worker_queues[worker_id].task_done()
+    except Exception:
+        # Decrement active connections on failure too
+        update_stats(worker_url, delta_conn=-1)
+        # Penalize failed worker slightly in stats? 
+        # For now, just ignore.
+
+def algo_round_robin(cluster_workers, counter):
+    w = cluster_workers[counter % len(cluster_workers)]
+    return w, (counter + 1)
+
+def algo_weighted_rr(cluster_workers, counter):
+    expanded = []
+    for w in cluster_workers:
+        w_val = weights.get(w, 1)
+        for _ in range(w_val):
+            expanded.append(w)
+            
+    if not expanded:
+        return cluster_workers[0], counter
+        
+    w = expanded[counter % len(expanded)]
+    return w, (counter + 1)
+
+def algo_least_response(cluster_workers):
+    with stats_lock:
+        return min(cluster_workers, key=lambda w: worker_response_times.get(w, 1.0))
+
+def algo_least_connections(cluster_workers):
+    with stats_lock:
+        # Add a tiny bit of random noise to break ties, otherwise it always picks the first one when all are 0
+        return min(cluster_workers, key=lambda w: active_connections.get(w, 0))
+
+def process_pipeline(cluster_id, algorithm, kafka_group_id):
+    consumer = Consumer({
+        'bootstrap.servers': KAFKA_BROKER,
+        'group.id': kafka_group_id,
+        'auto.offset.reset': 'latest'
+    })
+    consumer.subscribe([INPUT_TOPIC])
+    
+    local_workers = workers_config[cluster_id]
+    rr_counter = 0
+    
+    # Thread Pool for Async Requests
+    # 5 threads per cluster is enough to show concurrency effects without overwhelming
+    executor = ThreadPoolExecutor(max_workers=5) 
+    
+    print(f"[{cluster_id}] Started with {algorithm} (Workers: {len(local_workers)})")
+    
+    while True:
+        msg = consumer.poll(1.0)
+        if msg is None: continue
+        if msg.error(): continue
+        
+        try:
+            data = json.loads(msg.value().decode('utf-8'))
+            
+            # Select Worker
+            target_worker = local_workers[0]
+            
+            if algorithm == ALGO_ROUND_ROBIN:
+                target_worker, rr_counter = algo_round_robin(local_workers, rr_counter)
+            elif algorithm == ALGO_WEIGHTED_RR:
+                target_worker, rr_counter = algo_weighted_rr(local_workers, rr_counter)
+            elif algorithm == ALGO_LEAST_RESPONSE:
+                target_worker = algo_least_response(local_workers)
+            elif algorithm == ALGO_LEAST_CONN:
+                target_worker = algo_least_connections(local_workers)
+            
+            # Submit to Executor (Async)
+            executor.submit(handle_request, target_worker, data, cluster_id, algorithm)
             
         except Exception:
-            pass
+            traceback.print_exc()
 
-def round_robin_balancer(rr_counter):
-    worker_id = workers[rr_counter % num_workers]
-    return worker_id, (rr_counter + 1)
-
-def least_response_time_balancer():
-    best_worker = min(workers, key=lambda w: worker_stats[w]['processing_time'])
-    return best_worker
-
-def consume_and_balance():
-    global current_algo
-    
+def main():
     init_db()
-    rr_counter = 0
-
-    conf = {
-        'bootstrap.servers': KAFKA_BROKER,
-        'group.id': 'load-balancer-group',
-        'auto.offset.reset': 'latest',
-        'enable.auto.commit': True
-    }
-
-    consumer = Consumer(conf)
     
-    try:
-        consumer.subscribe([INPUT_TOPIC])
+    threads = []
+    
+    simulations = [
+        (CLUSTER_A, ALGO_ROUND_ROBIN, 'group-a'),
+        (CLUSTER_B, ALGO_WEIGHTED_RR, 'group-b'),
+        (CLUSTER_C, ALGO_LEAST_CONN, 'group-c'),
+        (CLUSTER_D, ALGO_LEAST_RESPONSE, 'group-d')
+    ]
+    
+    for cluster, algo, group in simulations:
+        t = threading.Thread(target=process_pipeline, args=(cluster, algo, group))
+        t.start()
+        threads.append(t)
         
-        # Start Worker Threads
-        for w in workers:
-            t = threading.Thread(target=worker_thread, args=(w,), daemon=True)
-            t.start()
-        
-        print(f"Load Balancer started. Listening on {INPUT_TOPIC}...")
-        
-        start_time = time.time()
-
-        while True:
-            # Poll for message
-            msg = consumer.poll(timeout=1.0)
-            
-            if msg is None:
-                continue
-            if msg.error():
-                if msg.error().code() == KafkaError._PARTITION_EOF:
-                    continue
-                else:
-                    print(msg.error())
-                    continue
-
-            # Switch algorithm every 30 seconds
-            elapsed = time.time() - start_time
-            if int(elapsed / 30) % 2 == 0:
-                current_algo = ALGO_ROUND_ROBIN
-            else:
-                current_algo = ALGO_LEAST_RESPONSE
-
-            # Process Message
-            try:
-                data = json.loads(msg.value().decode('utf-8'))
-                
-                # Select Worker
-                if current_algo == ALGO_ROUND_ROBIN:
-                    target_worker, rr_counter = round_robin_balancer(rr_counter)
-                else:
-                    target_worker = least_response_time_balancer()
-                
-                worker_queues[target_worker].put(data)
-                
-            except json.JSONDecodeError:
-                print(f"Invalid JSON: {msg.value()}")
-
-    except KeyboardInterrupt:
-        print("Stopping Load Balancer...")
-    except Exception as e:
-        print(f"Error in Load Balancer: {e}")
-        traceback.print_exc()
-    finally:
-        consumer.close()
+    for t in threads:
+        t.join()
 
 if __name__ == "__main__":
-    consume_and_balance()
+    main()

@@ -8,79 +8,85 @@ import altair as alt
 DB_FILE = 'metrics.db'
 REFRESH_RATE_SEC = 2
 
-st.set_page_config(page_title="Load Balancer Simulation", layout="wide")
+st.set_page_config(page_title="Load Balancer Battle (4-Way)", layout="wide")
 
-def get_data(limit=500):
+def get_data(limit=2000):
     try:
         with sqlite3.connect(DB_FILE) as conn:
-            query = f"SELECT * FROM metrics ORDER BY id DESC LIMIT {limit}"
-            df = pd.read_sql_query(query, conn)
-            # Normalize timestamp for better plotting if needed, 
-            # currently just using raw timestamp or id for x-axis mostly
-            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='s')
-            return df
+            try:
+                query = f"SELECT * FROM metrics ORDER BY id DESC LIMIT {limit}"
+                df = pd.read_sql_query(query, conn)
+                return df
+            except Exception:
+                return pd.DataFrame()
     except Exception as e:
         st.error(f"Error reading database: {e}")
         return pd.DataFrame()
 
-# Dashboard Layout
-st.title("☁️ Cloud Load Balancing Simulation")
+def render_cluster_metrics(container, cluster_name, df_cluster):
+    with container:
+        # Determine Algorithm Name
+        algo_name = "Unknown"
+        if not df_cluster.empty:
+            algo_name = df_cluster.iloc[0]['algorithm']
+            
+        st.subheader(f"{cluster_name}")
+        st.caption(f"Algo: **{algo_name}**")
+        
+        if not df_cluster.empty:
+            latency = df_cluster['processing_time'].mean() * 1000
+            st.metric("Avg Latency", f"{latency:.2f} ms")
+            
+            # Latency Chart
+            chart = alt.Chart(df_cluster).mark_line().encode(
+                x=alt.X('timestamp:T', axis=alt.Axis(labels=False, title='')),
+                y='processing_time:Q',
+                color='worker_id:N',
+                tooltip=['worker_id', 'processing_time']
+            ).properties(height=200)
+            st.altair_chart(chart, use_container_width=True)
+            
+            # Request Count Chart
+            bar = alt.Chart(df_cluster).mark_bar().encode(
+                x=alt.X('worker_id:N', axis=alt.Axis(labels=True, title='')),
+                y='count():Q',
+                color='worker_id:N'
+            ).properties(height=150)
+            st.altair_chart(bar, use_container_width=True)
+        else:
+            st.write("No Data")
 
-# Metrics Container
+# Dashboard Layout
+st.title("⚔️ Load Balancing Algorithm Battle Royale")
+st.markdown("Comparing **4 Algorithms** across **12 Workers** in Real-Time")
+
 placeholder = st.empty()
 
 while True:
     df = get_data()
     
     with placeholder.container():
-        if not df.empty:
-            current_algo = df.iloc[0]['algorithm']
-            st.subheader(f"Current Algorithm: {current_algo}")
+        if not df.empty and 'cluster_id' in df.columns:
+            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='s')
             
-            # KPI Metrics
-            avg_latency = df['processing_time'].mean() * 1000 # to ms
-            avg_cpu = df['cpu_utilization'].mean()
-            total_processed = len(df)
+            # Split Data
+            c_a = df[df['cluster_id'] == 'Cluster-A']
+            c_b = df[df['cluster_id'] == 'Cluster-B']
+            c_c = df[df['cluster_id'] == 'Cluster-C']
+            c_d = df[df['cluster_id'] == 'Cluster-D']
             
-            kpi1, kpi2, kpi3 = st.columns(3)
-            kpi1.metric(label="ISV Latency (avg)", value=f"{avg_latency:.2f} ms")
-            kpi2.metric(label="Avg CPU Utilization", value=f"{avg_cpu:.1f} %")
-            kpi3.metric(label="Data Points (Window)", value=total_processed)
+            # 4 Columns
+            col1, col2, col3, col4 = st.columns(4)
             
-            # Charts
-            st.divider()
-            
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                st.markdown("### Real-time Latency per Worker")
-                chart_latency = alt.Chart(df).mark_line().encode(
-                    x='timestamp:T',
-                    y='processing_time:Q',
-                    color='worker_id:N',
-                    tooltip=['worker_id', 'processing_time', 'timestamp']
-                ).interactive()
-                st.altair_chart(chart_latency, use_container_width=True)
-
-            with col2:
-                st.markdown("### Queue Depth per Worker")
-                chart_queue = alt.Chart(df).mark_area(opacity=0.5).encode(
-                    x='timestamp:T',
-                    y='queue_depth:Q',
-                    color='worker_id:N',
-                    tooltip=['worker_id', 'queue_depth']
-                ).interactive()
-                st.altair_chart(chart_queue, use_container_width=True)
-                
-            st.markdown("### CPU Utilization per Worker")
-            chart_cpu = alt.Chart(df).mark_bar().encode(
-                x='worker_id:N',
-                y='mean(cpu_utilization):Q',
-                color='worker_id:N'
-            )
-            st.altair_chart(chart_cpu, use_container_width=True)
+            render_cluster_metrics(col1, "Cluster A", c_a)
+            render_cluster_metrics(col2, "Cluster B", c_b)
+            render_cluster_metrics(col3, "Cluster C", c_c)
+            render_cluster_metrics(col4, "Cluster D", c_d)
 
         else:
-            st.info("Waiting for data... Ensure Producer and Load Balancer are running.")
+            if df.empty:
+                st.info("Waiting for data... Ensure Producer and Load Balancer are running.")
+            else:
+                st.warning("Database schema updating... One moment.")
             
     time.sleep(REFRESH_RATE_SEC)

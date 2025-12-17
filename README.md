@@ -1,25 +1,27 @@
-# Big Data Architecture Simulation (Kafka + Streamlit)
+# Big Data Architecture Simulation (Massive Scale)
 
-This project simulates a real-time data pipeline for load balancing optimization.
+This project simulates a real-time data pipeline for comparative load balancing analysis.
 
 ## Architecture
-1.  **Producer (`producer.py`)**: Simulates 50+ IoT sensors sending JSON data to Kafka.
-2.  **Middleware (Kafka)**: Buffers incoming data.
-3.  **Load Balancer (`load_balancer.py`)**: Consumes data, distributes to worker threads using Round Robin / Least Response Time, and logs metrics to SQLite.
-4.  **Dashboard (`dashboard.py`)**: Visualizes real-time metrics.
+1.  **Producer (`producer.py`)**: Simulates IoT sensors sending data to Kafka (Port 9093).
+2.  **Workers (Docker)**: **12 separate Flask-based containers** simulating cloud servers.
+    -   **Cluster A**: Workers 1-3 (Round Robin)
+    -   **Cluster B**: Workers 4-6 (Weighted Round Robin)
+    -   **Cluster C**: Workers 7-9 (Least Connections)
+    -   **Cluster D**: Workers 10-12 (Least Response Time)
+3.  **Load Balancer (`load_balancer.py`)**: Consumes from Kafka, distributes requests via HTTP, tracks metrics.
+4.  **Dashboard (`dashboard.py`)**: Visualizes real-time performance comparison.
 
 ## Prerequisites
 - Docker & Docker Compose
-- Python 3.9+
-- Kafka (provided via Docker)
+- Python 3.9+ (8GB RAM recommended)
 
 ## Setup
 
 1.  **Start Infrastructure**
     ```bash
-    docker-compose up -d
+    docker-compose up -d --build
     ```
-    *Access Kafka UI at [http://localhost:8080](http://localhost:8080).*
 
 2.  **Install Dependencies**
     ```bash
@@ -30,7 +32,7 @@ This project simulates a real-time data pipeline for load balancing optimization
 
 ## Usage
 
-Run the following commands in separate terminal windows (make sure `venv` is activated in each):
+Run the following commands in separate terminal windows (with `venv` active):
 
 1.  **Start Producer**
     ```bash
@@ -41,12 +43,12 @@ Run the following commands in separate terminal windows (make sure `venv` is act
     ```bash
     python load_balancer.py
     ```
+    *This script runs 4 internal threads to drive all 4 clusters simultaneously.*
 
 3.  **Start Dashboard**
     ```bash
     streamlit run dashboard.py
     ```
 
-## Troubleshooting
-- If Kafka fails to connect, ensure the Docker containers are healthy: `docker-compose ps`.
-- If Streamlit doesn't show data, wait a few seconds for the `producer` and `load_balancer` to populate the database.
+## Comparison
+The dashboard displays 4 columns, one for each algorithm, allowing you to see which strategy handles load best under various conditions.
