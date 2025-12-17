@@ -1,0 +1,5 @@
+confluent-kafka
+streamlit
+pandas
+altair
+watchdog
