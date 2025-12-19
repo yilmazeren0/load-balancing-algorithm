@@ -35,20 +35,46 @@ def simulated_sensor_data(sensor_id):
         'timestamp': time.time()
     }
 
-def run_simulation(num_sensors=50, interval_ms=100):
+def load_config():
+    try:
+        with open('producer_config.json', 'r') as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {'interval_ms': 100, 'num_sensors': 50}
+    except Exception:
+        return None
+
+def run_simulation(default_num_sensors=50, default_interval_ms=100):
     producer = get_producer()
     if not producer:
         print("Could not create Kafka producer. Exiting.")
         return
 
-    print(f"Starting simulation with {num_sensors} sensors sending data every {interval_ms}ms...")
+    # Initial config
+    config = load_config()
+    num_sensors = config.get('num_sensors', default_num_sensors)
+    interval_ms = config.get('interval_ms', default_interval_ms)
+
+    print(f"Starting simulation. Initial config: {num_sensors} sensors, {interval_ms}ms interval.")
     
     # Generate stable IDs for sensors
-    sensor_ids = [str(uuid.uuid4()) for _ in range(num_sensors)]
+    # Generate stable IDs for sensors (max possible to avoid churn)
+    # We generate a large pool and pick based on current config
+    sensor_pool = [str(uuid.uuid4()) for _ in range(500)] 
     
     try:
         while True:
-            for sid in sensor_ids:
+            # We use active_sensors from the updated block below for next iteration,
+            # but for the very first loop we need to define it or reorganize.
+            # Simplified:
+            current_config = load_config() or {'num_sensors': default_num_sensors, 'interval_ms': default_interval_ms}
+            
+            num_s = current_config.get('num_sensors', default_num_sensors)
+            interval = current_config.get('interval_ms', default_interval_ms)
+            
+            active_ids = sensor_pool[:num_s]
+            
+            for sid in active_ids:
                 data = simulated_sensor_data(sid)
                 value_json = json.dumps(data).encode('utf-8')
                 producer.produce(TOPIC, value=value_json, callback=delivery_callback)
@@ -56,6 +82,16 @@ def run_simulation(num_sensors=50, interval_ms=100):
             # Serve delivery reports triggered by produce()
             producer.poll(0)
             
+            # Dynamic Config Update
+            new_config = load_config()
+            if new_config:
+                interval_ms = new_config.get('interval_ms', interval_ms)
+                # Adjust active sensors
+                current_num = new_config.get('num_sensors', num_sensors)
+                active_sensors = sensor_pool[:current_num]
+            else:
+                active_sensors = sensor_pool[:num_sensors]
+
             time.sleep(interval_ms / 1000.0)
     except KeyboardInterrupt:
         print("\nStopping simulation.")

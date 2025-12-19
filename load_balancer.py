@@ -51,6 +51,7 @@ stats_lock = threading.Lock()
 def init_db():
     with sqlite3.connect(DB_FILE) as conn:
         cursor = conn.cursor()
+        cursor.execute('PRAGMA journal_mode=WAL;')
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS metrics (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -87,13 +88,11 @@ def update_stats(worker_url, delta_conn=0, duration=None):
 
 def handle_request(worker_url, data, cluster_id, algorithm):
     try:
-        # Increment active connections
-        update_stats(worker_url, delta_conn=1)
+        # Notes: Active connections are now incremented in the main loop BEFORE submission
+        # to prevent race conditions. We only decrement here.
         
         resp = requests.post(f"{worker_url}/process", json=data, timeout=5)
         
-        # Decrement active connections
-        update_stats(worker_url, delta_conn=-1)
         
         if resp.status_code == 200:
             res_json = resp.json()
@@ -105,22 +104,30 @@ def handle_request(worker_url, data, cluster_id, algorithm):
             # Log to DB
             log_metric(res_json['worker_id'], cluster_id, duration, algorithm)
             
-    except Exception:
-        # Decrement active connections on failure too
+    finally:
+        # Decrement active connections in all cases (success or failure)
         update_stats(worker_url, delta_conn=-1)
-        # Penalize failed worker slightly in stats? 
-        # For now, just ignore.
 
 def algo_round_robin(cluster_workers, counter):
     w = cluster_workers[counter % len(cluster_workers)]
     return w, (counter + 1)
 
+# Cache for expanded weighted lists
+weighted_lists_cache = {}
+
 def algo_weighted_rr(cluster_workers, counter):
-    expanded = []
-    for w in cluster_workers:
-        w_val = weights.get(w, 1)
-        for _ in range(w_val):
-            expanded.append(w)
+    # Create a cache key based on the workers list
+    # (Simplified assumption: workers list order/content doesn't change rapidly for the same cluster)
+    cache_key = tuple(cluster_workers)
+    
+    expanded = weighted_lists_cache.get(cache_key)
+    if not expanded:
+        expanded = []
+        for w in cluster_workers:
+            w_val = weights.get(w, 1)
+            for _ in range(w_val):
+                expanded.append(w)
+        weighted_lists_cache[cache_key] = expanded
             
     if not expanded:
         return cluster_workers[0], counter
@@ -176,6 +183,11 @@ def process_pipeline(cluster_id, algorithm, kafka_group_id):
             elif algorithm == ALGO_LEAST_CONN:
                 target_worker = algo_least_connections(local_workers)
             
+            # Increment active connections IMMEDIATELY to reflect pending work
+            # This prevents multiple requests being sent to the same 'idle' worker 
+            # while the previous ones are still in the thread pool queue.
+            update_stats(target_worker, delta_conn=1)
+
             # Submit to Executor (Async)
             executor.submit(handle_request, target_worker, data, cluster_id, algorithm)
             
